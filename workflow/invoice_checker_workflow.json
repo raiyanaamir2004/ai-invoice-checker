@@ -1,0 +1,364 @@
+{
+  "name": "Invoice vs Purchase Order Checker (AI)",
+  "nodes": [
+    {
+      "name": "New Invoice Email",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "has:attachment filename:pdf (subject:invoice OR subject:rechnung)",
+          "readStatus": "both"
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "id": "e13cd855-58c9-4859-aa44-e590cd3a6a6b"
+    },
+    {
+      "name": "Extract PDF Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "attachment_0",
+        "options": {}
+      },
+      "id": "47035392-0043-4742-b8ab-50572bf6d9a0"
+    },
+    {
+      "name": "Build AI Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Builds the request we send to the AI.\n// If OpenAI ever retires this model, change MODEL to a current one\n// (see platform.openai.com/docs/models) – nothing else needs to change.\nconst MODEL = 'gpt-6-luna';\n\nconst SYSTEM_PROMPT = `You read supplier invoices and return their data as JSON.\nThe invoice can be in English or German.\nReturn ONLY a JSON object with exactly these keys:\n{\n  \"invoice_number\": string,\n  \"invoice_date\": \"YYYY-MM-DD\",\n  \"supplier_name\": string,\n  \"po_number\": string or null,\n  \"currency\": string,\n  \"line_items\": [\n    { \"item_code\": string or null, \"description\": string, \"quantity\": number, \"unit_price\": number, \"line_total\": number }\n  ],\n  \"net_total\": number,\n  \"vat_amount\": number,\n  \"gross_total\": number\n}\nRules:\n- po_number is the BUYER purchase order reference (for example labelled PO Number, Customer PO, Your order reference, or in German Bestellnummer).\n- Write numbers as plain numbers with a dot for decimals. Convert German style 1.234,56 to 1234.56. No currency signs.\n- Write dates as YYYY-MM-DD, whatever format the invoice uses.\n- If something is missing, use null. Never invent values.`;\n\nreturn $input.all().map(item => ({\n  json: {\n    requestBody: {\n      model: MODEL,\n      response_format: { type: 'json_object' },\n      messages: [\n        { role: 'system', content: SYSTEM_PROMPT },\n        { role: 'user', content: 'Invoice text:\\n\\n' + (item.json.text || '') }\n      ]\n    }\n  }\n}));\n"
+      },
+      "id": "d9622b43-38b6-4a76-b2e1-1f9a67e07212"
+    },
+    {
+      "name": "AI Reads Invoice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requestBody) }}",
+        "options": {}
+      },
+      "id": "7470bf9f-bce2-4ecf-975b-09f50e15192b"
+    },
+    {
+      "name": "Parse AI Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Turns the AI's text answer into clean fields we can work with.\nreturn $input.all().map(item => {\n  let content = item.json.choices?.[0]?.message?.content ?? '';\n  // Some models wrap JSON in ```json ... ``` – remove that if present\n  content = content.replace(/^\\s*```(?:json)?\\s*/i, '').replace(/\\s*```\\s*$/, '');\n  try {\n    return { json: JSON.parse(content) };\n  } catch (e) {\n    return { json: { parse_error: 'The AI did not return valid JSON', raw: content } };\n  }\n});\n"
+      },
+      "id": "6615d4d6-c1ec-4dbb-b1f9-dc8054dae208"
+    },
+    {
+      "name": "Read Purchase Orders",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1180,
+        300
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Purchase_Orders",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "db22fc05-8567-4b5f-9a54-12917bfa40af"
+    },
+    {
+      "name": "Compare Invoice vs PO",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Compares every invoice with its purchase order (3-way check idea, simplified to 2-way).\n// Output fields match the column headers of the Invoice_Log tab exactly.\nconst TOLERANCE = 0.01; // allow 1 cent rounding difference\n\n// Reads numbers written as 1234.5, \"1,234.50\" or German \"1.234,50\"\nconst toNum = (v) => {\n  if (v === null || v === undefined || v === '') return NaN;\n  if (typeof v === 'number') return v;\n  let s = String(v).replace(/[^0-9,.\\-]/g, '');\n  if (s.lastIndexOf(',') > s.lastIndexOf('.')) s = s.replace(/\\./g, '').replace(',', '.');\n  else s = s.replace(/,/g, '');\n  return parseFloat(s);\n};\nconst differs = (a, b) => !Number.isFinite(a) || !Number.isFinite(b) || Math.abs(a - b) > TOLERANCE;\nconst fmt = (n) => (Number.isFinite(n) ? n.toFixed(2) : '?');\nconst round2 = (n) => (Number.isFinite(n) ? Math.round(n * 100) / 100 : '');\nconst norm = (s) => String(s ?? '').trim().toUpperCase();\nconst loose = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9äöüß]/g, '');\n\nconst invoices = $('Parse AI Result').all().map(i => i.json);\nconst poRows = $input.all().map(i => i.json).filter(r => r.PO_Number);\nconst processedAt = (typeof $now !== 'undefined') ? $now.toFormat('yyyy-MM-dd HH:mm') : new Date().toISOString();\n\nreturn invoices.map(inv => {\n  const issues = [];\n  let status = 'OK';\n  const poNumber = norm(inv.po_number);\n  const lines = poRows.filter(r => norm(r.PO_Number) === poNumber);\n  const poNet = lines.length ? lines.reduce((s, r) => s + toNum(r.Quantity) * toNum(r.Unit_Price), 0) : NaN;\n  const items = Array.isArray(inv.line_items) ? inv.line_items : [];\n  let invNet = toNum(inv.net_total);\n  if (!Number.isFinite(invNet)) invNet = items.reduce((s, li) => s + toNum(li.line_total), 0);\n\n  if (inv.parse_error) {\n    status = 'ERROR';\n    issues.push(inv.parse_error);\n  } else if (!poNumber) {\n    status = 'NO PO';\n    issues.push('No purchase order number found on the invoice');\n  } else if (lines.length === 0) {\n    status = 'NO PO';\n    issues.push(`${poNumber} was not found in Purchase_Orders`);\n  } else {\n    // 1. Supplier name should match the PO\n    const a = loose(inv.supplier_name), b = loose(lines[0].Supplier);\n    if (!a || !(a.includes(b) || b.includes(a))) {\n      issues.push(`Supplier \"${inv.supplier_name}\" differs from PO supplier \"${lines[0].Supplier}\"`);\n    }\n    // 2. Every invoice line must match an ordered line (by item code, else by description)\n    const used = new Set();\n    for (const li of items) {\n      const code = norm(li.item_code);\n      let idx = code ? lines.findIndex((r, i) => !used.has(i) && norm(r.Item_Code) === code) : -1;\n      if (idx === -1) idx = lines.findIndex((r, i) => !used.has(i) && norm(r.Description) === norm(li.description));\n      if (idx === -1) {\n        issues.push(`${li.item_code || li.description}: billed but not on the purchase order`);\n        continue;\n      }\n      used.add(idx);\n      const r = lines[idx];\n      const qInv = toNum(li.quantity), qPo = toNum(r.Quantity);\n      const pInv = toNum(li.unit_price), pPo = toNum(r.Unit_Price);\n      if (differs(qInv, qPo)) issues.push(`${r.Item_Code}: quantity ${qInv} billed, ${qPo} ordered`);\n      if (differs(pInv, pPo)) issues.push(`${r.Item_Code}: unit price ${fmt(pInv)} billed, ${fmt(pPo)} agreed`);\n    }\n    // 3. Ordered items missing from the invoice\n    lines.forEach((r, i) => { if (!used.has(i)) issues.push(`${r.Item_Code}: ordered but not on the invoice`); });\n    // 4. Totals\n    if (differs(invNet, poNet)) issues.push(`Net total ${fmt(invNet)} billed vs ${fmt(poNet)} on the PO`);\n    const vat = toNum(inv.vat_amount), gross = toNum(inv.gross_total);\n    if (Number.isFinite(vat) && Number.isFinite(gross) && Math.abs(invNet + vat - gross) > 0.02) {\n      issues.push(`Invoice maths: net ${fmt(invNet)} + VAT ${fmt(vat)} is not the total ${fmt(gross)}`);\n    }\n    if (issues.length) status = 'MISMATCH';\n  }\n\n  return {\n    json: {\n      Processed_At: processedAt,\n      Invoice_Number: inv.invoice_number ?? '',\n      Invoice_Date: inv.invoice_date ?? '',\n      Supplier: inv.supplier_name ?? '',\n      PO_Number: poNumber,\n      Invoice_Net: status === 'ERROR' ? '' : round2(invNet),\n      PO_Net: round2(poNet),\n      Difference: status === 'ERROR' ? '' : round2(invNet - poNet),\n      Status: status,\n      Issues: issues.length ? issues.join('; ') : 'All items match the purchase order',\n    },\n  };\n});\n"
+      },
+      "id": "b60a2329-2da3-49af-ad49-831390700dd1"
+    },
+    {
+      "name": "Log to Invoice_Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1660,
+        190
+      ],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Invoice_Log",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "a53a130b-d375-472d-8040-41e12cce8b4f"
+    },
+    {
+      "name": "Problem Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1660,
+        410
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "90829bbb-1ad0-4527-bb48-14715ca179b3",
+              "leftValue": "={{ $json.Status }}",
+              "rightValue": "OK",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "225cca55-863b-449c-8556-8d3441aa4df1"
+    },
+    {
+      "name": "Send Alert Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1900,
+        400
+      ],
+      "parameters": {
+        "sendTo": "YOUR_EMAIL@gmail.com",
+        "subject": "=Invoice check: {{ $json.Status }} – {{ $json.Invoice_Number }} ({{ $json.Supplier }})",
+        "emailType": "text",
+        "message": "=An invoice did not pass the purchase order check.\n\nInvoice: {{ $json.Invoice_Number }} from {{ $json.Supplier }}\nPurchase order: {{ $json.PO_Number }}\nInvoice net: {{ $json.Invoice_Net }} | PO net: {{ $json.PO_Net }} | Difference: {{ $json.Difference }}\n\nIssues:\n- {{ $json.Issues.split('; ').join('\\n- ') }}\n\nPlease check this invoice before it is paid.\nSent automatically by the n8n invoice checker.",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "162dd52e-2b7b-4df1-b402-b3e4c010399b"
+    },
+    {
+      "id": "5636d5ca-ecd3-4491-9dd4-2e14e95e4a14",
+      "name": "Note 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        110
+      ],
+      "parameters": {
+        "content": "## 1. Get the invoice\nA new email with \"invoice\" or \"Rechnung\" in the subject and a PDF attached starts the workflow. The PDF text is pulled out.",
+        "width": 480,
+        "height": 360,
+        "color": 7
+      }
+    },
+    {
+      "id": "0c98307c-0655-4651-8239-da154e098b14",
+      "name": "Note 2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        420,
+        110
+      ],
+      "parameters": {
+        "content": "## 2. AI reads it\nThe text is sent to OpenAI, which returns the supplier, PO number, items, quantities, prices and totals as clean JSON (works for English and German).",
+        "width": 660,
+        "height": 360,
+        "color": 4
+      }
+    },
+    {
+      "id": "f8ddba93-f2c3-43ad-a6d3-de284d7c346b",
+      "name": "Note 3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        40
+      ],
+      "parameters": {
+        "content": "## 3. Check and report\nThe invoice is compared with the purchase order in Google Sheets. Every result is logged. If something is wrong, an alert email is sent.",
+        "width": 1000,
+        "height": 520,
+        "color": 5
+      }
+    }
+  ],
+  "connections": {
+    "New Invoice Email": {
+      "main": [
+        [
+          {
+            "node": "Extract PDF Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract PDF Text": {
+      "main": [
+        [
+          {
+            "node": "Build AI Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build AI Request": {
+      "main": [
+        [
+          {
+            "node": "AI Reads Invoice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Reads Invoice": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Result": {
+      "main": [
+        [
+          {
+            "node": "Read Purchase Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Purchase Orders": {
+      "main": [
+        [
+          {
+            "node": "Compare Invoice vs PO",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compare Invoice vs PO": {
+      "main": [
+        [
+          {
+            "node": "Log to Invoice_Log",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Problem Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Problem Found?": {
+      "main": [
+        [
+          {
+            "node": "Send Alert Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
