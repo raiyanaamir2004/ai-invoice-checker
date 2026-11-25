@@ -1,0 +1,15 @@
+# Secrets – never upload API keys
+.env
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Node
+node_modules/
+
+# System files
+.DS_Store
+Thumbs.db
